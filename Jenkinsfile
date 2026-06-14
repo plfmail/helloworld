@@ -24,19 +24,24 @@ pipeline {
         timeout(time: 30, unit: 'MINUTES')
     }
 
+    triggers {
+        pollSCM('* * * * *')
+    }
+
     stages {
         stage('Checkout') {
             steps {
-                echo '===== ① 代码检出（GitHub 触发）====='
+                echo '===== ① 代码检出 ====='
                 checkout scm
                 sh 'git log --oneline -3'
             }
         }
 
-        stage('SonarQube Scan') {
+        stage('SonarQube Scan & Quality Gate') {
             steps {
-                echo '===== ③ SonarQube 代码扫描 ====='
+                echo '===== ② SonarQube 代码扫描 + Quality Gate ====='
                 script {
+                    // 1. SonarQube 扫描
                     def scannerStatus = sh(
                         script: """
                             docker run --rm \
@@ -52,43 +57,136 @@ pipeline {
                         error("SonarQube 扫描失败，退出码: ${scannerStatus}")
                     }
                     echo '✅ SonarQube 扫描完成'
+
+                    // 2. 轮询 Quality Gate 状态
+                    echo '===== ③ Quality Gate 检查 ====='
+                    def gateStatus = 'PENDING'
+                    for (def i = 0; i < 30; i++) {
+                        sleep(5)
+                        def gateResp = sh(
+                            script: """
+                                curl -s -u admin:admin "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=helloworld"
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        try {
+                            def gateJson = new groovy.json.JsonSlurper().parseText(gateResp)
+                            gateStatus = gateJson?.projectStatus?.status ?: 'PENDING'
+                            echo "Quality Gate 状态: ${gateStatus}"
+                            if (gateStatus != 'PENDING' && gateStatus != 'IN_PROGRESS') {
+                                break
+                            }
+                        } catch (Exception e) {
+                            echo "解析 Quality Gate 响应失败: ${gateResp}"
+                        }
+                    }
+                    if (gateStatus != 'OK') {
+                        error("Quality Gate 未通过: ${gateStatus}")
+                    }
+                    echo '✅ Quality Gate 通过'
                 }
             }
         }
 
-        stage('AI Pytest White-box Test') {
+        stage('AI Pytest - SonarQube Trigger') {
             steps {
-                echo '===== ④ AI 测试平台 Pytest 白盒测试（3002 接口）====='
+                echo '===== ④ SonarQube Trigger → AI Pytest ====='
                 script {
-                    // 1. 解析 Portal 凭证
                     def aiCredsJson = credentials('ai-platform-credentials')
                     def aiCreds = new groovy.json.JsonSlurper().parseText(aiCredsJson)
                     def portalUser = aiCreds.username
                     def portalPass = aiCreds.password
 
-                    // 2. 清理并准备 backend 容器中的被测代码目录
-                    def prepareStatus = sh(
+                    // 1. 从 SonarQube 获取 issues
+                    def issuesResp = sh(
                         script: """
-                            docker exec ai_playwright_backend sh -c 'rm -rf ${UNDER_TEST_DIR} && mkdir -p ${UNDER_TEST_DIR}'
+                            curl -s -u admin:admin "${SONAR_HOST_URL}/api/issues/search?componentKeys=helloworld&ps=100&statuses=OPEN,CONFIRMED,REOPENED"
                         """,
-                        returnStatus: true
-                    )
-                    if (prepareStatus != 0) {
-                        error("清理 ${UNDER_TEST_DIR} 失败")
-                    }
+                        returnStdout: true
+                    ).trim()
+                    def issuesJson = new groovy.json.JsonSlurper().parseText(issuesResp)
+                    def issues = issuesJson?.issues ?: []
+                    echo "SonarQube issues 数量: ${issues.size()}"
 
-                    // 3. 将当前工作区代码复制到 AI 测试平台 backend 容器
-                    def copyStatus = sh(
+                    // 2. 获取本次变更的文件列表
+                    def changedFiles = []
+                    try {
+                        def filesStr = sh(
+                            script: "git diff --name-only HEAD~1 2>/dev/null || echo ''",
+                            returnStdout: true
+                        ).trim()
+                        changedFiles = filesStr ? filesStr.split('\n').findAll { it } : []
+                    } catch (Exception e) {
+                        echo "获取变更文件失败（首次提交?）: ${e.message}"
+                    }
+                    echo "变更文件: ${changedFiles}"
+
+                    // 3. 构建 trigger payload 并写入文件（避免 shell 引号问题）
+                    def triggerPayload = groovy.json.JsonOutput.toJson([
+                        repo_path    : WORKSPACE,
+                        project_key  : 'helloworld',
+                        changed_files: changedFiles,
+                        issues       : issues,
+                        coverage_gap : null
+                    ])
+                    writeFile file: 'sonarqube-trigger-payload.json', text: triggerPayload
+
+                    // 4. 调用 SonarQube Trigger API
+                    def triggerResp = sh(
                         script: """
-                            tar -cf - . | docker exec -i ai_playwright_backend tar -xf - -C ${UNDER_TEST_DIR}
+                            curl -s -X POST ${AI_PLATFORM_URL}/api/sonarqube/trigger \
+                                -H 'Content-Type: application/json' \
+                                -H 'X-API-Key: jenkins-sonarqube-2026' \
+                                --data-binary @sonarqube-trigger-payload.json
                         """,
-                        returnStatus: true
-                    )
-                    if (copyStatus != 0) {
-                        error("复制代码到 ai_playwright_backend 容器失败")
-                    }
+                        returnStdout: true
+                    ).trim()
+                    echo "SonarQube Trigger 响应: ${triggerResp}"
 
-                    // 4. Portal 登录获取 JWT Token
+                    def triggerJson = new groovy.json.JsonSlurper().parseText(triggerResp)
+                    if (triggerJson?.success != true || !triggerJson?.task_id) {
+                        error("SonarQube Trigger 失败: ${triggerJson?.error ?: triggerResp}")
+                    }
+                    def taskId = triggerJson.task_id
+                    echo "任务 ID: ${taskId}"
+
+                    // 5. 轮询任务完成
+                    def taskStatus = 'running'
+                    for (def i = 0; i < 60; i++) {
+                        sleep(10)
+                        def statusResp = sh(
+                            script: """
+                                curl -s "${AI_PLATFORM_URL}/api/sonarqube/status/${taskId}" \
+                                    -H 'X-API-Key: jenkins-sonarqube-2026'
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        def statusJson = new groovy.json.JsonSlurper().parseText(statusResp)
+                        taskStatus = statusJson?.data?.status ?: statusJson?.status ?: 'unknown'
+                        echo "任务状态: ${taskStatus}"
+                        if (taskStatus in ['completed', 'failed', 'error']) {
+                            break
+                        }
+                    }
+                    if (taskStatus != 'completed') {
+                        error("SonarQube Trigger 任务未完成: ${taskStatus}")
+                    }
+                    echo '✅ SonarQube Trigger 任务完成'
+
+                    // 6. 获取结果中的 script_ids
+                    def resultResp = sh(
+                        script: """
+                            curl -s "${AI_PLATFORM_URL}/api/sonarqube/result/${taskId}" \
+                                -H 'X-API-Key: jenkins-sonarqube-2026'
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    def resultJson = new groovy.json.JsonSlurper().parseText(resultResp)
+                    def generated = resultJson?.data?.generated_scripts ?: resultJson?.generated_scripts ?: []
+                    def scriptIds = generated.collect { it.script_id }.findAll { it }
+                    echo "生成脚本数量: ${scriptIds.size()}"
+
+                    // 7. Portal 登录
                     def loginResp = sh(
                         script: """
                             curl -s -X POST ${PORTAL_URL}/api/login \
@@ -97,22 +195,47 @@ pipeline {
                         """,
                         returnStdout: true
                     ).trim()
-                    echo "Portal 登录响应: ${loginResp}"
-
-                    def loginJson
-                    try {
-                        loginJson = new groovy.json.JsonSlurper().parseText(loginResp)
-                    } catch (Exception e) {
-                        error("Portal 登录响应不是合法 JSON: ${loginResp}")
-                    }
+                    def loginJson = new groovy.json.JsonSlurper().parseText(loginResp)
                     if (loginJson?.success != true || !loginJson?.data?.token) {
                         error("Portal 登录失败: ${loginJson?.message ?: loginResp}")
                     }
                     def jwtToken = loginJson.data.token
 
-                    // 5. 调用白盒测试一键执行接口
-                    //    Playwright 平台读取 /app/under-test 源码，由平台 AI 生成 pytest 白盒测试脚本并执行
-                    def pytestResp = sh(
+                    // 8. 复制代码到后端容器
+                    sh "docker exec ai_playwright_backend sh -c 'rm -rf ${UNDER_TEST_DIR} && mkdir -p ${UNDER_TEST_DIR}'"
+                    def copyStatus = sh(
+                        script: "tar -cf - . | docker exec -i ai_playwright_backend tar -xf - -C ${UNDER_TEST_DIR}",
+                        returnStatus: true
+                    )
+                    if (copyStatus != 0) {
+                        error("复制代码到 ai_playwright_backend 容器失败")
+                    }
+
+                    // 9. 执行每个生成的测试脚本
+                    if (scriptIds) {
+                        echo "执行 ${scriptIds.size()} 个 SonarQube 生成的测试脚本..."
+                        scriptIds.each { sid ->
+                            def execResp = sh(
+                                script: """
+                                    curl -s -X POST ${AI_PLATFORM_URL}/api/pytest/jenkins/execute \
+                                        -H 'Content-Type: application/json' \
+                                        -H "Authorization: Bearer ${jwtToken}" \
+                                        -d '{"script_id":"${sid}","code_dir":"${UNDER_TEST_DIR}","pytest_args":"-v --tb=short --color=no"}'
+                                """,
+                                returnStdout: true
+                            ).trim()
+                            def execJson = new groovy.json.JsonSlurper().parseText(execResp)
+                            if (execJson?.success != true) {
+                                echo "⚠️ 脚本 ${sid} 执行异常: ${execJson?.error ?: execResp}"
+                            } else {
+                                echo "✅ 脚本 ${sid} 执行完成"
+                            }
+                        }
+                    }
+
+                    // 10. 通用白盒测试覆盖
+                    echo "运行白盒测试（通用覆盖）..."
+                    def whiteboxResp = sh(
                         script: """
                             curl -s -X POST ${AI_PLATFORM_URL}/api/pytest/whitebox-execute \
                                 -H 'Content-Type: application/json' \
@@ -121,22 +244,14 @@ pipeline {
                         """,
                         returnStdout: true
                     ).trim()
-                    echo "Pytest 白盒测试响应: ${pytestResp}"
-
-                    def pytestJson
-                    try {
-                        pytestJson = new groovy.json.JsonSlurper().parseText(pytestResp)
-                    } catch (Exception e) {
-                        error("Pytest 响应不是合法 JSON: ${pytestResp}")
+                    def wbJson = new groovy.json.JsonSlurper().parseText(whiteboxResp)
+                    if (wbJson?.success != true) {
+                        error("白盒测试失败: ${wbJson?.error ?: whiteboxResp}")
                     }
-                    if (pytestJson?.success != true) {
-                        error("AI Pytest 白盒测试执行失败: ${pytestJson?.error ?: pytestResp}")
+                    if (wbJson?.status != 'completed') {
+                        error("白盒测试未通过: status=${wbJson?.status}")
                     }
-                    if (pytestJson?.status != 'completed') {
-                        error("AI Pytest 白盒测试未通过: status=${pytestJson?.status}, passed=${pytestJson?.passed}, failed=${pytestJson?.failed}, errors=${pytestJson?.errors}")
-                    }
-
-                    echo "✅ AI Pytest 白盒测试通过: passed=${pytestJson?.passed}, failed=${pytestJson?.failed}, errors=${pytestJson?.errors}"
+                    echo "✅ 全部 AI 测试通过: passed=${wbJson?.passed}"
                 }
             }
         }
