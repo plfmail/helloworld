@@ -100,7 +100,7 @@ pipeline {
                     LOGIN_RESP=\$(curl -s -X POST "\${PORTAL_URL}/api/login" \
                         -H 'Content-Type: application/json' \
                         -d '{"username":"admin","password":"Admin@123456"}')
-                    JWT_TOKEN=\$(echo "\$LOGIN_RESP" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+                    JWT_TOKEN=\$(echo "\$LOGIN_RESP" | sed -n 's/.*"token":"\\([^"]*\\)".*/\\1/p')
                     if [ -z "$JWT_TOKEN" ]; then
                         echo "Portal 登录失败: $LOGIN_RESP"
                         exit 1
