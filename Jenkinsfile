@@ -97,10 +97,10 @@ pipeline {
 
                     # 1. Portal 登录
                     echo "[1/3] Portal 登录..."
-                    LOGIN_RESP=$(curl -s -X POST "${PORTAL_URL}/api/login" \
+                    LOGIN_RESP=\$(curl -s -X POST "\${PORTAL_URL}/api/login" \
                         -H 'Content-Type: application/json' \
                         -d '{"username":"admin","password":"Admin@123456"}')
-                    JWT_TOKEN=$(echo "$LOGIN_RESP" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+                    JWT_TOKEN=\$(echo "\$LOGIN_RESP" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
                     if [ -z "$JWT_TOKEN" ]; then
                         echo "Portal 登录失败: $LOGIN_RESP"
                         exit 1
@@ -128,7 +128,7 @@ pipeline {
                         -d "\$PAYLOAD")
                     echo "白盒测试响应: \$WHITEBOX_RESP"
 
-                    STATUS=\$(echo "\$WHITEBOX_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null)
+                    STATUS=\$(echo "\$WHITEBOX_RESP" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
                     if [ "\$STATUS" != "completed" ]; then
                         echo "白盒测试未通过: \$WHITEBOX_RESP"
                         exit 1
