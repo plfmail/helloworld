@@ -95,7 +95,7 @@ pipeline {
                     def portalUser = 'admin'
                     def portalPass = 'Admin@123456'
 
-                    // 1. Portal 登录
+                    echo '[1/3] Portal 登录...'
                     def loginResp = sh(
                         script: """
                             curl -s -X POST ${PORTAL_URL}/api/login \
@@ -109,8 +109,9 @@ pipeline {
                         error("Portal 登录失败: ${loginJson?.message ?: loginResp}")
                     }
                     def jwtToken = loginJson.data.token
+                    echo 'Portal 登录成功'
 
-                    // 2. 复制代码到后端容器
+                    echo '[2/3] 复制代码到后端容器...'
                     sh "docker exec ai_playwright_backend sh -c 'rm -rf ${UNDER_TEST_DIR} && mkdir -p ${UNDER_TEST_DIR}'"
                     def copyStatus = sh(
                         script: "tar -cf - . | docker exec -i ai_playwright_backend tar -xf - -C ${UNDER_TEST_DIR}",
@@ -119,8 +120,9 @@ pipeline {
                     if (copyStatus != 0) {
                         error("复制代码到 ai_playwright_backend 容器失败")
                     }
+                    echo '代码复制完成'
 
-                    // 3. 白盒测试
+                    echo '[3/3] 执行白盒测试...'
                     def whiteboxResp = sh(
                         script: """
                             curl -s -X POST ${AI_PLATFORM_URL}/api/pytest/whitebox-execute \
