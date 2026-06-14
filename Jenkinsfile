@@ -37,53 +37,20 @@ pipeline {
             }
         }
 
-        stage('SonarQube Scan & Quality Gate') {
+        stage('SonarQube Scan') {
             steps {
-                echo '===== ② SonarQube 代码扫描 + Quality Gate ====='
-                script {
-                    // 1. SonarQube 扫描
-                    def scannerStatus = sh(
-                        script: """
-                            docker run --rm \
-                                --network ai_network \
-                                --volumes-from cicd-jenkins \
-                                -e SONAR_HOST_URL=${SONAR_HOST_URL} \
-                                -w "${WORKSPACE}" \
-                                sonarsource/sonar-scanner-cli
-                        """,
-                        returnStatus: true
-                    )
-                    if (scannerStatus != 0) {
-                        error("SonarQube 扫描失败，退出码: ${scannerStatus}")
-                    }
-                    echo '✅ SonarQube 扫描完成'
+                echo '===== ② SonarQube 代码扫描 ====='
+                withSonarQubeEnv('my-sonarqube') {
+                    sh 'sonar-scanner -Dsonar.projectKey=helloworld -Dsonar.sources=. -Dsonar.host.url=${SONAR_HOST_URL}'
+                }
+            }
+        }
 
-                    // 2. 轮询 Quality Gate 状态
-                    echo '===== ③ Quality Gate 检查 ====='
-                    def gateStatus = 'PENDING'
-                    for (def i = 0; i < 30; i++) {
-                        sleep(5)
-                        def gateResp = sh(
-                            script: """
-                                curl -s -u admin:admin "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=helloworld"
-                            """,
-                            returnStdout: true
-                        ).trim()
-                        try {
-                            def gateJson = new groovy.json.JsonSlurper().parseText(gateResp)
-                            gateStatus = gateJson?.projectStatus?.status ?: 'PENDING'
-                            echo "Quality Gate 状态: ${gateStatus}"
-                            if (gateStatus != 'PENDING' && gateStatus != 'IN_PROGRESS') {
-                                break
-                            }
-                        } catch (Exception e) {
-                            echo "解析 Quality Gate 响应失败: ${gateResp}"
-                        }
-                    }
-                    if (gateStatus != 'OK') {
-                        error("Quality Gate 未通过: ${gateStatus}")
-                    }
-                    echo '✅ Quality Gate 通过'
+        stage('Quality Gate') {
+            steps {
+                echo '===== ③ Quality Gate 检查 ====='
+                timeout(time: 1, unit: 'HOURS') {
+                    waitForQualityGate abortPipeline: true
                 }
             }
         }
