@@ -92,10 +92,8 @@ pipeline {
             steps {
                 echo '===== ④ SonarQube Trigger → AI Pytest ====='
                 script {
-                    def aiCredsJson = credentials('ai-platform-credentials')
-                    def aiCreds = new groovy.json.JsonSlurper().parseText(aiCredsJson)
-                    def portalUser = aiCreds.username
-                    def portalPass = aiCreds.password
+                    def portalUser = 'admin'
+                    def portalPass = 'Admin@123456'
 
                     // 1. 从 SonarQube 获取 issues
                     def issuesResp = sh(
