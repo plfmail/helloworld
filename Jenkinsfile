@@ -41,7 +41,7 @@ pipeline {
             steps {
                 echo '===== ② SonarQube 代码扫描 ====='
                 withSonarQubeEnv('my-sonarqube') {
-                    sh 'sonar-scanner -Dsonar.projectKey=helloworld -Dsonar.sources=. -Dsonar.host.url=${SONAR_HOST_URL}'
+                    sh "docker run --rm --network ai_network --volumes-from cicd-jenkins -e SONAR_HOST_URL=\${SONAR_HOST_URL} -e SONAR_AUTH_TOKEN=\${SONAR_AUTH_TOKEN} -w \"${WORKSPACE}\" sonarsource/sonar-scanner-cli -Dsonar.projectKey=helloworld -Dsonar.sources=."
                 }
             }
         }
