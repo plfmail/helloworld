@@ -91,76 +91,62 @@ pipeline {
         stage('AI Pytest - Whitebox') {
             steps {
                 echo '===== ④ AI Pytest 白盒测试 ====='
-                script {
-                    def portalUser = 'admin'
-                    def portalPass = 'Admin@123456'
+                sh label: 'AI Pytest whitebox', script: """
+                    PORTAL_URL="http://ai_portal:5003"
+                    AI_URL="http://ai_playwright_frontend:3000"
 
-                    echo '[1/3] Portal 登录...'
-                    def loginResp = sh(
-                        script: """
-                            curl -s -X POST ${PORTAL_URL}/api/login \
-                                -H 'Content-Type: application/json' \
-                                -d '{"username":"${portalUser}","password":"${portalPass}"}'
-                        """,
-                        returnStdout: true
-                    ).trim()
-                    def loginJson = new groovy.json.JsonSlurper().parseText(loginResp)
-                    if (loginJson?.success != true || !loginJson?.data?.token) {
-                        error("Portal 登录失败: ${loginJson?.message ?: loginResp}")
-                    }
-                    def jwtToken = loginJson.data.token
-                    echo 'Portal 登录成功'
+                    # 1. Portal 登录
+                    echo "[1/3] Portal 登录..."
+                    LOGIN_RESP=\$(curl -s -X POST "\${PORTAL_URL}/api/login" \
+                        -H 'Content-Type: application/json' \
+                        -d '{"username":"admin","password":"Admin@123456"}')
+                    JWT_TOKEN=\$(echo "\$LOGIN_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])" 2>/dev/null)
+                    if [ -z "\$JWT_TOKEN" ]; then
+                        echo "Portal 登录失败: \$LOGIN_RESP"
+                        exit 1
+                    fi
+                    echo "Portal 登录成功"
 
-                    echo '[2/3] 复制代码到后端容器...'
-                    sh "docker exec ai_playwright_backend sh -c 'rm -rf ${UNDER_TEST_DIR} && mkdir -p ${UNDER_TEST_DIR}'"
-                    def copyStatus = sh(
-                        script: "tar -cf - . | docker exec -i ai_playwright_backend tar -xf - -C ${UNDER_TEST_DIR}",
-                        returnStatus: true
-                    )
-                    if (copyStatus != 0) {
-                        error("复制代码到 ai_playwright_backend 容器失败")
+                    # 2. 复制代码到后端容器
+                    echo "[2/3] 复制代码到后端容器..."
+                    docker exec ai_playwright_backend sh -c "rm -rf \${UNDER_TEST_DIR} && mkdir -p \${UNDER_TEST_DIR}" || {
+                        echo "清理目标目录失败"
+                        exit 1
                     }
-                    echo '代码复制完成'
+                    tar -cf - . | docker exec -i ai_playwright_backend tar -xf - -C "\${UNDER_TEST_DIR}" || {
+                        echo "复制代码失败"
+                        exit 1
+                    }
+                    echo "代码复制完成"
 
-                    echo '[3/3] 执行白盒测试...'
-                    def whiteboxResp = sh(
-                        script: """
-                            curl -s -X POST ${AI_PLATFORM_URL}/api/pytest/whitebox-execute \
-                                -H 'Content-Type: application/json' \
-                                -H "Authorization: Bearer ${jwtToken}" \
-                                -d '{"test_dir":"${UNDER_TEST_DIR}","name":"helloworld_${BUILD_NUMBER}","pytest_args":"-v --tb=short --color=no"}'
-                        """,
-                        returnStdout: true
-                    ).trim()
-                    echo "白盒测试响应: ${whiteboxResp}"
-                    def wbJson = new groovy.json.JsonSlurper().parseText(whiteboxResp)
-                    if (wbJson?.success != true) {
-                        error("白盒测试失败: ${wbJson?.error ?: whiteboxResp}")
-                    }
-                    if (wbJson?.status != 'completed') {
-                        error("白盒测试未通过: status=${wbJson?.status}")
-                    }
-                    echo "✅ 白盒测试通过: passed=${wbJson?.passed}"
-                }
+                    # 3. 白盒测试
+                    echo "[3/3] 执行白盒测试..."
+                    PAYLOAD=\$(printf '{"test_dir":"%s","name":"helloworld_%s","pytest_args":"-v --tb=short --color=no"}' "\${UNDER_TEST_DIR}" "\${BUILD_NUMBER}")
+                    WHITEBOX_RESP=\$(curl -s -X POST "\${AI_URL}/api/pytest/whitebox-execute" \
+                        -H 'Content-Type: application/json' \
+                        -H "Authorization: Bearer \${JWT_TOKEN}" \
+                        -d "\$PAYLOAD")
+                    echo "白盒测试响应: \$WHITEBOX_RESP"
+
+                    STATUS=\$(echo "\$WHITEBOX_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null)
+                    if [ "\$STATUS" != "completed" ]; then
+                        echo "白盒测试未通过: \$WHITEBOX_RESP"
+                        exit 1
+                    fi
+                    echo "✅ 白盒测试通过"
+                """
             }
         }
 
         stage('AI Pytest - SonarQube Trigger') {
             steps {
                 echo '===== ⑤ SonarQube Trigger（非阻塞）====='
-                script {
-                    // 简单触发，issues 由后端处理，不阻塞 pipeline
-                    def triggerResp = sh(
-                        script: """
-                            curl -s -X POST ${AI_PLATFORM_URL}/api/sonarqube/trigger \
-                                -H 'Content-Type: application/json' \
-                                -H 'X-API-Key: jenkins-sonarqube-2026' \
-                                -d '{"project_key":"helloworld","repo_path":"","changed_files":[],"issues":[],"coverage_gap":null}'
-                        """,
-                        returnStdout: true
-                    ).trim()
-                    echo "SonarQube Trigger 响应: ${triggerResp}"
-                }
+                sh label: 'SonarQube trigger', script: """
+                    curl -s -X POST http://ai_playwright_frontend:3000/api/sonarqube/trigger \
+                        -H 'Content-Type: application/json' \
+                        -H 'X-API-Key: jenkins-sonarqube-2026' \
+                        -d '{"project_key":"helloworld","repo_path":"","changed_files":[],"issues":[],"coverage_gap":null}'
+                """
             }
         }
 
