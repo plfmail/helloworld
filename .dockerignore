@@ -1,0 +1,12 @@
+.git
+.gitignore
+Dockerfile
+.dockerignore
+Jenkinsfile
+sonar-project.properties
+*.md
+__pycache__
+*.pyc
+.pytest_cache
+.vscode
+.idea
