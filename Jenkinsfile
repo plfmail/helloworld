@@ -128,12 +128,12 @@ pipeline {
                         -d "\$PAYLOAD")
                     echo "白盒测试响应: \$WHITEBOX_RESP"
 
-                    STATUS=\$(echo "\$WHITEBOX_RESP" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
-                    if [ "\$STATUS" != "completed" ]; then
+                    if echo "\$WHITEBOX_RESP" | grep -q '"status":"completed"'; then
+                        echo "✅ 白盒测试通过"
+                    else
                         echo "白盒测试未通过: \$WHITEBOX_RESP"
                         exit 1
                     fi
-                    echo "✅ 白盒测试通过"
                 """
             }
         }
