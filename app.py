@@ -5,7 +5,7 @@ from flask import Flask
 app = Flask(__name__)
 
 
-@app.route('/')
+@app.route('/', methods=['GET'])
 def index():
     """Return the hello world page."""
     return (
@@ -18,5 +18,6 @@ def index():
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5008))
-    app.run(host='0.0.0.0', port=port)
+    host = os.environ.get('HOST', '127.0.0.1')
+    port = int(os.environ.get('PORT', '5008'))
+    app.run(host=host, port=port)
