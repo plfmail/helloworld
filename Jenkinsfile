@@ -1,174 +1,204 @@
 pipeline {
     agent any
-
-    environment {
-        // AI 测试平台前端地址（容器内网络，3002 映射）
-        AI_PLATFORM_URL = 'http://ai_playwright_frontend:3000'
-        PORTAL_URL = 'http://ai_portal:5003'
-
-        // SonarQube 地址（容器内网络）
-        SONAR_HOST_URL = 'http://cicd-sonarqube:9000'
-
-        // 部署配置
-        IMAGE_NAME = 'helloworld'
-        DEPLOY_CONTAINER = 'helloworld-dev'
-        DEPLOY_HOST_PORT = '8080'
-        APP_PORT = '5008'
-
-        // 被测代码在 AI 测试平台 backend 容器中的目标目录
-        UNDER_TEST_DIR = '/app/under-test'
-    }
-
     options {
-        buildDiscarder(logRotator(numToKeepStr: '10'))
-        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 2, unit: 'HOURS')
     }
-
+    parameters {
+        string(name: 'GIT_REPO_URL', defaultValue: '', description: 'Git仓库地址（Webhook触发自动填充）')
+        string(name: 'GIT_BRANCH', defaultValue: 'main', description: '分支名（Webhook触发自动填充）')
+        string(name: 'GIT_COMMIT_ID', defaultValue: '', description: 'Commit ID（Webhook触发自动填充）')
+        booleanParam(name: 'SKIP_SONAR', defaultValue: false, description: '跳过SonarQube扫描')
+        booleanParam(name: 'SKIP_AI_TEST', defaultValue: false, description: '跳过AI自动测试')
+    }
+    environment {
+        PORTAL_URL      = "http://ai_portal:5003"
+        PLAYWRIGHT_URL  = "http://ai_playwright_backend:5000"
+        SONAR_HOST_URL  = "http://cicd-sonarqube:9000"
+        SONAR_TOKEN     = credentials('sonarqube-token')
+        REPORT_DIR      = "${WORKSPACE}/reports"
+        UNDER_TEST_DIR  = "/app/under-test"
+    }
     triggers {
-        pollSCM('* * * * *')
+        GenericTrigger(
+            genericVariables: [
+                [key: 'GIT_REPO_URL', value: '$.repository.clone_url'],
+                [key: 'GIT_BRANCH', value: '$.ref', regexpFilter: 'refs/heads/', replacement: ''],
+                [key: 'GIT_COMMIT_ID', value: '$.after']
+            ],
+            token: 'ai-ci-full-pipeline',
+            printContributedVariables: true,
+            printPostContent: true,
+            causeString: 'Git Push触发: ${GIT_REPO_URL} @ ${GIT_COMMIT_ID}'
+        )
     }
-
     stages {
-        stage('Checkout') {
+        stage('0. 初始化') {
             steps {
-                echo '===== ① 代码检出 ====='
-                checkout scm
-                sh 'git log --oneline -3'
-            }
-        }
-
-        stage('SonarQube Scan') {
-            steps {
-                echo '===== ② SonarQube 代码扫描 ====='
-                withSonarQubeEnv('my-sonarqube') {
-                    sh "docker run --rm --network ai_network --volumes-from cicd-jenkins -e SONAR_HOST_URL=\${SONAR_HOST_URL} -e SONAR_AUTH_TOKEN=\${SONAR_AUTH_TOKEN} -w \"${WORKSPACE}\" sonarsource/sonar-scanner-cli -Dsonar.projectKey=helloworld -Dsonar.sources=."
+                script {
+                    sh "mkdir -p ${REPORT_DIR}"
+                    echo "=== 构建信息 ==="
+                    echo "Git仓库 : ${params.GIT_REPO_URL}"
+                    echo "分支    : ${params.GIT_BRANCH}"
+                    echo "Commit  : ${params.GIT_COMMIT_ID}"
+                    echo "跳过Sonar : ${params.SKIP_SONAR}"
+                    echo "跳过AI测试: ${params.SKIP_AI_TEST}"
                 }
             }
         }
 
-        stage('Quality Gate') {
+        stage('1. 拉取代码') {
+            when { expression { return params.GIT_REPO_URL } }
             steps {
-                echo '===== ③ Quality Gate 检查 ====='
+                script {
+                    git(
+                        url: params.GIT_REPO_URL,
+                        branch: params.GIT_BRANCH,
+                        credentialsId: ''
+                    )
+                    sh "mkdir -p ${REPORT_DIR}"
+                    sh "git log --oneline -3"
+                    sh "git diff HEAD^ HEAD > ${REPORT_DIR}/code_diff.txt 2>/dev/null || echo 'First commit, no diff' > ${REPORT_DIR}/code_diff.txt"
+                    echo "代码拉取完成"
+                }
+            }
+        }
+
+        stage('2. SonarQube 扫描') {
+            when { expression { return !params.SKIP_SONAR && params.GIT_REPO_URL } }
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh "${tool('sonar-scanner')}/bin/sonar-scanner -Dsonar.projectKey=${JOB_NAME} -Dsonar.sources=."
+                }
+            }
+        }
+
+        stage('3. Quality Gate') {
+            when { expression { return !params.SKIP_SONAR && params.GIT_REPO_URL } }
+            steps {
                 timeout(time: 1, unit: 'HOURS') {
                     waitForQualityGate abortPipeline: true
                 }
             }
         }
 
-        stage('AI Pytest - Whitebox') {
+        stage('4. AI 白盒测试') {
+            when { expression { return !params.SKIP_AI_TEST && params.GIT_REPO_URL } }
             steps {
-                echo '===== ④ AI Pytest 白盒测试 ====='
-                sh label: 'AI Pytest whitebox', script: """
-                    PORTAL_URL="http://ai_portal:5003"
-                    AI_URL="http://ai_playwright_frontend:3000"
-
-                    # 1. Portal 登录
-                    echo "[1/3] Portal 登录..."
-                    LOGIN_RESP=\$(curl -s -X POST "\${PORTAL_URL}/api/login" \
-                        -H 'Content-Type: application/json' \
-                        -d '{"username":"admin","password":"Admin@123456"}')
-                    JWT_TOKEN=\$(echo "\$LOGIN_RESP" | sed -n 's/.*"token":"\\([^"]*\\)".*/\\1/p')
-                    if [ -z "$JWT_TOKEN" ]; then
-                        echo "Portal 登录失败: $LOGIN_RESP"
-                        exit 1
-                    fi
-                    echo "Portal 登录成功"
-
-                    # 2. 复制代码到后端容器
-                    echo "[2/3] 复制代码到后端容器..."
-                    docker exec ai_playwright_backend sh -c "rm -rf \${UNDER_TEST_DIR} && mkdir -p \${UNDER_TEST_DIR}" || {
-                        echo "清理目标目录失败"
-                        exit 1
-                    }
-                    tar -cf - . | docker exec -i ai_playwright_backend tar -xf - -C "\${UNDER_TEST_DIR}" || {
-                        echo "复制代码失败"
-                        exit 1
-                    }
-                    echo "代码复制完成"
-
-                    # 3. 白盒测试
-                    echo "[3/3] 执行白盒测试..."
-                    PAYLOAD=\$(printf '{"test_dir":"%s","name":"helloworld_%s","pytest_args":"-v --tb=short --color=no"}' "\${UNDER_TEST_DIR}" "\${BUILD_NUMBER}")
-                    WHITEBOX_RESP=\$(curl -s -X POST "\${AI_URL}/api/pytest/whitebox-execute" \
-                        -H 'Content-Type: application/json' \
-                        -H "Authorization: Bearer \${JWT_TOKEN}" \
-                        -d "\$PAYLOAD")
-                    echo "白盒测试响应: \$WHITEBOX_RESP"
-
-                    if echo "\$WHITEBOX_RESP" | grep -q '"status":"completed"'; then
-                        echo "✅ 白盒测试通过"
-                    else
-                        echo "白盒测试未通过: \$WHITEBOX_RESP"
-                        exit 1
-                    fi
-                """
-            }
-        }
-
-        stage('AI Pytest - SonarQube Trigger') {
-            steps {
-                echo '===== ⑤ SonarQube Trigger（非阻塞）====='
-                sh label: 'SonarQube trigger', script: """
-                    curl -s -X POST http://ai_playwright_frontend:3000/api/sonarqube/trigger \
-                        -H 'Content-Type: application/json' \
-                        -H 'X-API-Key: jenkins-sonarqube-2026' \
-                        -d '{"project_key":"helloworld","repo_path":"","changed_files":[],"issues":[],"coverage_gap":null}'
-                """
-            }
-        }
-
-        stage('Build Docker Image') {
-            steps {
-                echo '===== ⑤ Jenkins 构建编译 ====='
                 script {
-                    def buildStatus = sh(
-                        script: """
-                            tar -cf - . | docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} -t ${IMAGE_NAME}:latest -
-                        """,
-                        returnStatus: true
-                    )
-                    if (buildStatus != 0) {
-                        error("Docker 镜像构建失败")
+                    // 1. 登录 Portal
+                    echo "[1/5] 登录 AI 平台..."
+                    def loginResp = sh(returnStdout: true, script: """
+                        curl -s -X POST ${PORTAL_URL}/api/login \
+                        -H 'Content-Type: application/json' \
+                        -d '{"username":"admin","password":"Admin@123456"}'
+                    """).trim()
+                    env.JWT_TOKEN = sh(returnStdout: true, script: """
+                        echo '${loginResp}' | grep -o '"token":"[^"]*"' | head -1 | cut -d'"' -f4
+                    """).trim()
+                    if (!env.JWT_TOKEN) {
+                        error "AI平台登录失败: ${loginResp}"
                     }
-                    echo "✅ Docker 镜像构建完成: ${IMAGE_NAME}:${BUILD_NUMBER}"
-                }
-            }
-        }
 
-        stage('Deploy to Dev') {
-            steps {
-                echo '===== ⑥ 部署开发测试环境 ====='
-                script {
-                    def deployStatus = sh(
-                        script: """
-                            docker stop ${DEPLOY_CONTAINER} || true
-                            docker rm ${DEPLOY_CONTAINER} || true
-                            docker run -d --name ${DEPLOY_CONTAINER} \
-                                --network ai_network \
-                                -p ${DEPLOY_HOST_PORT}:${APP_PORT} \
-                                --restart unless-stopped \
-                                ${IMAGE_NAME}:latest
-                        """,
-                        returnStatus: true
-                    )
-                    if (deployStatus != 0) {
-                        error("部署到开发测试环境失败")
+                    // 2. 复制代码到 Playwright 后端容器
+                    echo "[2/5] 复制代码到后端容器..."
+                    sh """
+                        docker exec ai_playwright_backend sh -c "rm -rf ${UNDER_TEST_DIR} && mkdir -p ${UNDER_TEST_DIR}" || true
+                        tar -cf - . | docker exec -i ai_playwright_backend tar -xf - -C ${UNDER_TEST_DIR}
+                    """
+
+                    // 3. 调用 generate 生成测试脚本（入库）
+                    echo "[3/5] AI 生成 pytest 脚本..."
+                    def genPayload = groovy.json.JsonOutput.toJson([
+                        code_dir: UNDER_TEST_DIR,
+                        name: "helloworld_${BUILD_NUMBER}"
+                    ])
+                    def genResp = sh(returnStdout: true, script: """
+                        curl -s -X POST ${PLAYWRIGHT_URL}/api/pytest/jenkins/generate \
+                        -H 'Content-Type: application/json' \
+                        -H "Authorization: Bearer ${JWT_TOKEN}" \
+                        --max-time 300 \
+                        -d '${genPayload}'
+                    """).trim()
+                    echo "  generate: ${genResp}"
+
+                    def genJson = readJSON text: genResp
+                    def scriptId = genJson.script_id ?: ''
+                    if (!scriptId) {
+                        error "AI 生成测试脚本失败: ${genResp}"
                     }
-                    echo "🚀 应用已部署到开发测试环境: http://host.docker.internal:${DEPLOY_HOST_PORT}"
+                    echo "  script_id: ${scriptId}"
+
+                    // 4. 调用 execute 执行测试（入库）
+                    echo "[4/5] 执行 pytest..."
+                    def execPayload = groovy.json.JsonOutput.toJson([
+                        script_id: scriptId,
+                        code_dir: UNDER_TEST_DIR,
+                        pytest_args: "-v --tb=short --color=no"
+                    ])
+                    def execResp = sh(returnStdout: true, script: """
+                        curl -s -X POST ${PLAYWRIGHT_URL}/api/pytest/jenkins/execute \
+                        -H 'Content-Type: application/json' \
+                        -H "Authorization: Bearer ${JWT_TOKEN}" \
+                        --max-time 900 \
+                        -d '${execPayload}'
+                    """).trim()
+                    echo "  execute: ${execResp}"
+
+                    // 5. 解析结果 + 构建报告
+                    def result = readJSON text: execResp
+                    def passed  = result.passed  ?: 0
+                    def failed  = result.failed  ?: 0
+                    def errors  = result.errors  ?: 0
+                    def status  = result.status  ?: 'error'
+                    def elapsed = result.elapsed ?: 0
+
+                    env.AI_TEST_SUCCESS = (status == 'completed') ? 'true' : 'false'
+                    env.AI_TOTAL_PASSED = passed
+                    env.AI_TOTAL_FAILED = failed
+
+                    def statusIcon = (status == 'completed') ? 'PASS' : 'FAIL'
+                    def reportHtml = """
+<html><head><meta charset='utf-8'><title>CI 白盒测试报告</title>
+<style>body{font-family:monospace;margin:20px}table{border-collapse:collapse;width:100%}
+th,td{border:1px solid #ccc;padding:8px;text-align:left}th{background:#eee}
+.pass{color:#2e7d32}.fail{color:#c62828}</style></head><body>
+<h1>AI CI 白盒测试报告</h1>
+<p>项目: helloworld | 构建: #${BUILD_NUMBER} | script_id: ${scriptId}</p>
+<p>状态: ${statusIcon} | 通过: ${passed} | 失败: ${failed} | 错误: ${errors} | 耗时: ${elapsed}s</p>
+<pre>${result.summary ?: result.stdout ?: ''}</pre>
+<hr><p>脚本已入库，可在 Playwright 前端查看 | SonarQube + AI + Pytest</p></body></html>"""
+                    writeFile file: "${REPORT_DIR}/pytest_report.html", text: reportHtml
+                    writeFile file: "${REPORT_DIR}/pytest_result.json", text: execResp
+
+                    echo "=== AI测试完成: 通过${passed} 失败${failed} 错误${errors} ==="
+                    if (status != 'completed') {
+                        error "AI白盒测试未通过: ${status}"
+                    }
                 }
             }
         }
     }
-
     post {
         always {
-            echo "===== 流水线结束: ${env.JOB_NAME} #${env.BUILD_NUMBER} ====="
+            publishHTML(
+                target: [
+                    allowMissing: true,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: 'reports',
+                    reportFiles: 'pytest_report.html, code_diff.txt',
+                    reportName: 'CI 构建报告'
+                ]
+            )
+            deleteDir()
         }
         success {
-            echo "✅ 流水线执行成功！访问地址: http://host.docker.internal:${DEPLOY_HOST_PORT}"
+            echo "=== 全链路CI流程执行成功 ==="
+            echo "Sonar报告: ${SONAR_HOST_URL}/dashboard?id=${JOB_NAME}"
         }
         failure {
-            echo "❌ 流水线执行失败，请查看上方日志定位问题。"
+            echo "=== 全链路CI流程执行失败 ==="
         }
     }
 }
