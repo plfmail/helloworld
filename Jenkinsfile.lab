@@ -54,8 +54,9 @@ pipeline {
         // 部署容器名
         DEPLOY_CONTAINER = 'helloworld-deployed'
 
-        // Nexus 凭据（需在 Jenkins Credentials 中预先创建 ID 为 nexus-credentials 的凭据）
-        NEXUS_CREDENTIALS = credentials('nexus-credentials')
+        // Nexus 凭据（培训环境直接使用 Nexus admin 密码，生产环境应改用 Jenkins Credentials）
+        NEXUS_USER = 'admin'
+        NEXUS_PASS = 'd5d305d4-8347-4f5b-a597-760e485f9971'
     }
 
     // ==================== 阶段定义 ====================
@@ -150,10 +151,10 @@ pipeline {
                 echo '========== 阶段 4: 推送镜像到 Nexus =========='
                 echo "推送到: ${DOCKER_REGISTRY}"
 
-                // 登录 Nexus Docker Registry（使用 Jenkins Credentials Binding）
+                // 登录 Nexus Docker Registry（培训环境直接使用环境变量）
                 sh '''
-                    echo "$NEXUS_CREDENTIALS_PSW" | \
-                    docker login $DOCKER_REGISTRY -u $NEXUS_CREDENTIALS_USR --password-stdin
+                    echo "$NEXUS_PASS" | \
+                    docker login $DOCKER_REGISTRY -u $NEXUS_USER --password-stdin
                 '''
 
                 // 推送镜像
