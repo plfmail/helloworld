@@ -37,7 +37,7 @@ pipeline {
     // 环境变量（生产环境应从 Jenkins Credentials 读取）
     environment {
         // Nexus Docker Registry 地址
-        DOCKER_REGISTRY = 'localhost:8082'
+        DOCKER_REGISTRY = 'cicd-nexus:8082'
 
         // 镜像名称
         IMAGE_NAME      = 'helloworld'
