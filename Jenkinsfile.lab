@@ -1,0 +1,261 @@
+/******************************************************************************
+ * Jenkinsfile.lab — 培训实验用简化 CI/CD Pipeline（helloworld 适配版）
+ *
+ * 基于: 培训Demo/Jenkinsfile.lab
+ * 适配说明:
+ *   - 应用从 nginx 静态站点改为 helloworld Python Flask 应用
+ *   - 应用端口从 80 改为 5008
+ *   - 部署端口保持 8889
+ *   - 跳过 Unit Test 阶段（按培训要求）
+ *   - Build 阶段检查 app.py 与 Dockerfile
+ *   - 使用 Jenkins Credentials (nexus-credentials) 登录 Nexus
+ *
+ * 课程映射:
+ *   第一天 模块二: Checkout + Build + Docker Build + Push to Nexus
+ *   第二天 模块三: Deploy 阶段 + Portainer 验证
+ *   第二天 模块四: 完整流程走通 + Zabbix/Dozzle 验证
+ *
+ * 使用方法:
+ *   1. 在 Jenkins 中创建 Pipeline 项目
+ *   2. Pipeline Definition: Pipeline script from SCM
+ *   3. SCM: Git（指向本仓库）
+ *   4. Script Path: Jenkinsfile.lab
+ *   5. 保存后点击 Build Now 触发
+ ******************************************************************************/
+
+pipeline {
+    // ==================== 全局配置 ====================
+    agent any
+
+    options {
+        // 保留最近 10 次构建记录
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        // 单次构建超时 30 分钟
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    // 环境变量（生产环境应从 Jenkins Credentials 读取）
+    environment {
+        // Nexus Docker Registry 地址
+        DOCKER_REGISTRY = 'localhost:8082'
+
+        // 镜像名称
+        IMAGE_NAME      = 'helloworld'
+
+        // 镜像标签 = Jenkins 构建编号（每次构建唯一）
+        IMAGE_TAG       = "${BUILD_NUMBER}"
+
+        // 应用内部端口
+        APP_PORT        = '5008'
+
+        // 部署到宿主机的端口
+        DEPLOY_PORT     = '8889'
+
+        // 部署容器名
+        DEPLOY_CONTAINER = 'helloworld-deployed'
+
+        // Nexus 凭据（需在 Jenkins Credentials 中预先创建 ID 为 nexus-credentials 的凭据）
+        NEXUS_CREDENTIALS = credentials('nexus-credentials')
+    }
+
+    // ==================== 阶段定义 ====================
+
+    stages {
+
+        // ----------------------------------------------------------
+        // 阶段 1: Checkout — 从 Git 仓库拉取最新代码
+        // ----------------------------------------------------------
+        stage('1. Checkout') {
+            steps {
+                echo '========== 阶段 1: 代码检出 =========='
+                echo '从 Git 仓库拉取 helloworld 源代码...'
+
+                // Git 拉取（SCM 已在 Job 配置中指定）
+                checkout scm
+
+                echo '代码检出完成。当前工作目录内容:'
+                sh 'ls -la'
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 阶段 2: Build — 验证项目关键文件完整性
+        // ----------------------------------------------------------
+        stage('2. Build') {
+            steps {
+                echo '========== 阶段 2: 项目构建 =========='
+                echo '验证项目文件完整性...'
+
+                sh '''
+                    echo "=== 检查关键文件 ==="
+                    if [ -f "app.py" ]; then
+                        echo "[OK] app.py 存在"
+                    else
+                        echo "[FAIL] app.py 缺失!"
+                        exit 1
+                    fi
+
+                    if [ -f "Dockerfile" ]; then
+                        echo "[OK] Dockerfile 存在"
+                    else
+                        echo "[FAIL] Dockerfile 缺失!"
+                        exit 1
+                    fi
+
+                    if [ -f "requirements.txt" ]; then
+                        echo "[OK] requirements.txt 存在"
+                    else
+                        echo "[WARN] requirements.txt 缺失，但继续构建"
+                    fi
+
+                    echo "=== 文件列表 ==="
+                    find . -type f | head -20
+                '''
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 阶段 3: Docker Build — 使用 Dockerfile 构建 Docker 镜像
+        // ----------------------------------------------------------
+        stage('3. Docker Build') {
+            steps {
+                echo '========== 阶段 3: Docker 镜像构建 =========='
+                echo '使用 Dockerfile 构建镜像...'
+
+                // 构建 Docker 镜像，同时打本地标签和 Nexus Registry 标签
+                sh """
+                    docker build \\
+                        -t ${IMAGE_NAME}:${IMAGE_TAG} \\
+                        -t ${IMAGE_NAME}:latest \\
+                        -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} \\
+                        -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest \\
+                        .
+                """
+
+                echo "镜像构建完成: ${IMAGE_NAME}:${IMAGE_TAG}"
+
+                // 验证镜像存在
+                sh """
+                    echo "=== 已构建的镜像 ==="
+                    docker images ${IMAGE_NAME}
+                """
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 阶段 4: Push to Nexus — 将镜像推送到 Nexus 私有 Registry
+        // ----------------------------------------------------------
+        stage('4. Push to Nexus') {
+            steps {
+                echo '========== 阶段 4: 推送镜像到 Nexus =========='
+                echo "推送到: ${DOCKER_REGISTRY}"
+
+                // 登录 Nexus Docker Registry（使用 Jenkins Credentials Binding）
+                sh '''
+                    echo "$NEXUS_CREDENTIALS_PSW" | \
+                    docker login $DOCKER_REGISTRY -u $NEXUS_CREDENTIALS_USR --password-stdin
+                '''
+
+                // 推送镜像
+                sh """
+                    docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+                    docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest
+                """
+
+                echo "镜像已推送到 Nexus: ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 阶段 5: Deploy — 将镜像部署为运行中的容器
+        // ----------------------------------------------------------
+        stage('5. Deploy') {
+            steps {
+                echo '========== 阶段 5: 应用部署 =========='
+                echo "部署端口: ${DEPLOY_PORT} → ${APP_PORT}"
+
+                // 停止并删除旧容器（如果存在）
+                sh '''
+                    if docker ps -a --format "{{.Names}}" | grep -q "^${DEPLOY_CONTAINER}$"; then
+                        echo "停止旧容器..."
+                        docker stop ${DEPLOY_CONTAINER} || true
+                        docker rm ${DEPLOY_CONTAINER} || true
+                        echo "旧容器已清理"
+                    else
+                        echo "无需清理旧容器"
+                    fi
+                '''
+
+                // 启动新容器
+                sh """
+                    docker run -d \\
+                        --name ${DEPLOY_CONTAINER} \\
+                        --network ai_network \\
+                        --restart unless-stopped \\
+                        -p ${DEPLOY_PORT}:${APP_PORT} \\
+                        ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+                """
+
+                // 等待容器启动并验证
+                sh '''
+                    echo "等待容器启动..."
+                    sleep 5
+
+                    if docker ps --format "{{.Names}}" | grep -q "^${DEPLOY_CONTAINER}$"; then
+                        echo "[OK] 容器部署成功！"
+                        echo ""
+                        echo "=== 容器状态 ==="
+                        docker ps --filter "name=${DEPLOY_CONTAINER}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+                        echo ""
+                        echo "访问地址: http://localhost:${DEPLOY_PORT}"
+                    else
+                        echo "[FAIL] 容器启动失败！"
+                        docker logs ${DEPLOY_CONTAINER} --tail 20 || true
+                        exit 1
+                    fi
+                '''
+            }
+        }
+    }
+
+    // ==================== 后置处理 ====================
+    post {
+        // 无论成功或失败，都执行
+        always {
+            echo '========== Pipeline 执行完毕 =========='
+
+            // 清理本地 Registry 镜像标签（节省磁盘空间，Nexus 中已有副本）
+            sh '''
+                echo "清理本地临时镜像标签..."
+                docker rmi ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} 2>/dev/null || true
+                docker rmi ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest 2>/dev/null || true
+            '''
+        }
+
+        // 仅成功时执行
+        success {
+            echo '========== CI/CD 流程全部完成 =========='
+            echo "镜像: ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+            echo "部署: 容器 ${DEPLOY_CONTAINER}，端口 ${DEPLOY_PORT}"
+            echo ""
+            echo "下一步实验:"
+            echo "  → 在浏览器访问: http://localhost:${DEPLOY_PORT}"
+            echo "  → Portainer (http://localhost:6080) 中验证部署状态"
+            echo "  → Dozzle (http://localhost:9999) 中查看应用日志"
+            echo "  → Zabbix (http://localhost:8085) 中配置 HTTP 监控"
+        }
+
+        // 仅失败时执行
+        failure {
+            echo '========== CI/CD 流程失败 =========='
+            echo "请检查 Console Output 中的错误信息，逐阶段排查。"
+            echo ""
+            echo "常见排查方向:"
+            echo "  - 阶段 1 失败: 检查 Git 仓库地址和凭据"
+            echo "  - 阶段 2 失败: 检查 app.py、Dockerfile 是否存在于仓库根目录"
+            echo "  - 阶段 3 失败: 检查 Docker Desktop 是否运行、Dockerfile 语法是否正确"
+            echo "  - 阶段 4 失败: 检查 Nexus 是否运行、凭据 nexus-credentials 是否正确"
+            echo "  - 阶段 5 失败: 检查端口 ${DEPLOY_PORT} 是否被占用、cicd-network 是否存在"
+        }
+    }
+}
