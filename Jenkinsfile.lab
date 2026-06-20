@@ -56,7 +56,7 @@ pipeline {
 
         // Nexus 凭据（培训环境直接使用 Nexus admin 密码，生产环境应改用 Jenkins Credentials）
         NEXUS_USER = 'admin'
-        NEXUS_PASS = 'd5d305d4-8347-4f5b-a597-760e485f9971'
+        NEXUS_PASS = 'admin123'
     }
 
     // ==================== 阶段定义 ====================
@@ -256,7 +256,7 @@ pipeline {
             echo "  - 阶段 2 失败: 检查 app.py、Dockerfile 是否存在于仓库根目录"
             echo "  - 阶段 3 失败: 检查 Docker Desktop 是否运行、Dockerfile 语法是否正确"
             echo "  - 阶段 4 失败: 检查 Nexus 是否运行、凭据 nexus-credentials 是否正确"
-            echo "  - 阶段 5 失败: 检查端口 ${DEPLOY_PORT} 是否被占用、cicd-network 是否存在"
+            echo "  - 阶段 5 失败: 检查端口 ${DEPLOY_PORT} 是否被占用、ai_network / cd_ai_network 是否存在"
         }
     }
 }
